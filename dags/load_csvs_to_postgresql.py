@@ -1,15 +1,13 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
+from datetime import datetime
 import datetime as dt
-import os
 import csv
+import os
 import psycopg
 import glob
 import pendulum
-import pandas as pd
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, sum
+from airflow.utils.dates import days_ago
 
 # PostgreSQL 连接设置
 conn_params = {
@@ -20,24 +18,26 @@ conn_params = {
     "port": "5432"
 }
 
-# 默认 DAG 参数
+# 默认参数
 default_args = {
     'owner': 'airflow',
-    'start_date': pendulum.datetime(2024, 1, 1, tz="UTC"),
+    'start_date': days_ago(1),  # 设置 DAG 的开始时间为当前时间减去一天
     'retries': 1,
     'retry_delay': dt.timedelta(minutes=2),
-    'execution_timeout': dt.timedelta(minutes=1),  # 任务超时设置
+    'execution_timeout': dt.timedelta(minutes=1),  # 设置任务超时时间
 }
 
 
-# 步骤1：上传 CSV 文件数据到 PostgreSQL
+# CSV 文件处理函数
 def process_csv_file(file_path, **kwargs):
     conn = psycopg.connect(**conn_params)
     with conn.cursor() as cur:
+        # 读取文件名中的日期
         file_name = os.path.basename(file_path)
         date_str = file_name.split(".")[0]
-        file_date = dt.datetime.strptime(date_str, '%Y-%m-%d').date()
+        file_date = datetime.strptime(date_str, '%Y-%m-%d').date()
 
+        # 确保表存在
         cur.execute("""
             CREATE TABLE IF NOT EXISTS smart_data (
                 id SERIAL PRIMARY KEY,
@@ -57,9 +57,11 @@ def process_csv_file(file_path, **kwargs):
             )
         """)
 
+        # 打开 CSV 文件
         with open(file_path, 'r') as f:
             reader = csv.reader(f)
             headers = next(reader)
+
             for row in reader:
                 row = [None if v == '' else v for v in row]
                 cur.execute("""
@@ -75,46 +77,22 @@ def process_csv_file(file_path, **kwargs):
     conn.close()
 
 
-# 步骤2：从 PostgreSQL 中读取数据并进行分析
-def analyze_data_from_postgres(**kwargs):
-    # 使用 psycopg2 从 PostgreSQL 中读取数据
-    conn = psycopg.connect(**conn_params)
-    query = "SELECT date, serial_number, failure FROM smart_data"
-    df_postgres = pd.read_sql(query, conn)
-    conn.close()
-
-    # 将 Pandas DataFrame 转换为 PySpark DataFrame
-    spark = SparkSession.builder.appName("Daily Drive Summary").getOrCreate()
-    df_spark = spark.createDataFrame(df_postgres)
-
-    # 数据清洗和处理
-    df_spark = df_spark.select("date", "serial_number", "failure").dropna()
-    df_spark = df_spark.filter(col("failure").isin(0, 1))  # 过滤无效数据
-
-    # 汇总每日硬盘数量和故障数量
-    daily_summary = df_spark.groupBy("date").agg(
-        count("serial_number").alias("drive_count"),
-        sum(col("failure")).alias("drive_failures")
-    )
-
-    # 将结果保存到 CSV
-    daily_summary.write.csv("output/daily_summary.csv", header=True)
-    spark.stop()
-
-
-# 搜索 CSV 文件
+# 搜索符合条件的 CSV 文件
 def find_csv_files(**kwargs):
-    return glob.glob('mydata/**/*.csv', recursive=True)
+    csv_files = glob.glob('mydata/**/*.csv', recursive=True)
+    return csv_files
 
 
-# 定义 DAG
+# 定义 Airflow DAG
 with DAG(
-        dag_id='upload_and_analyze_daily_csv_to_postgres',
+        dag_id='load_csvs_to_postgresql',
         default_args=default_args,
         catchup=False,
+        schedule_interval=None,  # 禁止调度
         dagrun_timeout=dt.timedelta(minutes=60),
+        tags=['load', 'csv', 'postgresql', 'practice'],
 ) as dag:
-    # 搜索 CSV 文件任务
+    # 搜索 CSV 文件的任务
     search_csv_task = PythonOperator(
         task_id='search_csv_files',
         python_callable=find_csv_files,
@@ -122,7 +100,7 @@ with DAG(
     )
 
 
-    # 动态生成上传 CSV 数据的任务
+    # 导入每个 CSV 文件的任务
     def create_csv_import_tasks(file_path):
         return PythonOperator(
             task_id=f'process_{os.path.basename(file_path)}',
@@ -132,15 +110,9 @@ with DAG(
         )
 
 
+    # 动态生成 CSV 处理任务
     csv_files = find_csv_files()
     process_csv_tasks = [create_csv_import_tasks(file) for file in csv_files]
 
-    # 分析数据的任务
-    analyze_data_task = PythonOperator(
-        task_id='analyze_data',
-        python_callable=analyze_data_from_postgres,
-        provide_context=True
-    )
-
     # 设置任务依赖
-    search_csv_task >> process_csv_tasks >> analyze_data_task
+    search_csv_task >> process_csv_tasks
