@@ -78,13 +78,13 @@ def unzip_files(source_dir=custom_source_dir, target_base_dir=custom_target_base
 
 
 # 删除表的函数
-def drop_smart_data_table(**kwargs):
+def drop_driver_data_table(**kwargs):
     conn = get_postgres_conn()
     with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS smart_data")
+        cur.execute("DROP TABLE IF EXISTS driver_data")
         conn.commit()
     conn.close()
-    logging.info("已删除 smart_data 表")
+    logging.info("已删除 driver_data 表")
 
 
 # 处理 CSV 文件
@@ -97,25 +97,17 @@ def process_csv_file(file_path, **kwargs):
         # 创建表的操作单独放在一个事务中
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS smart_data (
+                CREATE TABLE IF NOT EXISTS driver_data (
                     id SERIAL PRIMARY KEY,
                     date DATE,
                     serial_number VARCHAR(255),
                     model VARCHAR(255),
                     capacity_bytes BIGINT,
-                    failure BIGINT,
-                    datacenter VARCHAR(255),
-                    cluster_id BIGINT,
-                    vault_id BIGINT,
-                    pod_id BIGINT,
-                    pod_slot_num BIGINT,
-                    is_legacy_format BOOLEAN,
-                    smart_1_normalized BIGINT,
-                    smart_1_raw BIGINT
+                    failure BIGINT
                 )
             """)
             conn.commit()
-            logging.info("已创建 smart_data 表")
+            logging.info("已创建 driver_data 表")
 
         # 批量插入数据的操作保证在一个事务中
         with conn.cursor() as cur, open(file_path, 'r') as f:
@@ -129,25 +121,17 @@ def process_csv_file(file_path, **kwargs):
             for row in reader:
                 row = [None if v == '' else v for v in row]  # 替换空值为 None
                 batch_data.append((
-                    file_date, row[1], row[2],
+                    file_date,
+                    row[1],
+                    row[2],
                     int(row[3]) if row[3] else None,
                     int(row[4]) if row[4] else None,
-                    row[5],
-                    int(row[6]) if row[6] else None,
-                    int(row[7]) if row[7] else None,
-                    int(row[8]) if row[8] else None,
-                    int(row[9]) if row[9] else None,
-                    row[10] == 'True',
-                    int(row[11]) if row[11] else None,
-                    int(row[12]) if row[12] else None
                 ))
 
                 if len(batch_data) >= batch_size:
                     cur.executemany("""
-                        INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
-                                                cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
-                                                smart_1_normalized, smart_1_raw)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO driver_data (date, serial_number, model, capacity_bytes, failure)
+                        VALUES (%s, %s, %s, %s, %s)
                     """, batch_data)
 
                     insert_count += len(batch_data)
@@ -157,10 +141,8 @@ def process_csv_file(file_path, **kwargs):
             # 插入剩余的批次数据
             if batch_data:
                 cur.executemany("""
-                    INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
-                                            cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
-                                            smart_1_normalized, smart_1_raw)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO driver_data (date, serial_number, model, capacity_bytes, failure)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, batch_data)
 
                 insert_count += len(batch_data)
@@ -186,7 +168,7 @@ def clean_data(**kwargs):
     conn = get_postgres_conn()
 
     # 查询所有数据
-    query = "SELECT date, serial_number, model, failure FROM smart_data"
+    query = "SELECT date, serial_number, model, failure FROM driver_data"
     df_postgres = pd.read_sql(query, conn)
 
     # 创建 SparkSession
@@ -199,29 +181,25 @@ def clean_data(**kwargs):
     df_spark = spark.createDataFrame(df_postgres)
 
     # 分区以并行处理, 可以根据集群资源调整分区数目
-    df_spark = df_spark.repartition(8)  # 假设使用 8 个分区
+    df_spark = df_spark.repartition(8)
     logging.info(f"原始数据量: {df_spark.count()}")
 
-    # 移除特定列中的空值
-    df_cleaned = df_spark.dropna(subset=["date", "serial_number", "model"])
-    logging.info(f"移除空值后的数据量: {df_cleaned.count()}")
+    # 数据清理和品牌分类
+    df_spark = df_spark.select("date", "serial_number", "model", "failure") \
+        .dropna(subset=["date", "serial_number", "model", "failure"]) \
+        .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
+        .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
+        .dropDuplicates()
 
     # 打印 failure 列的分布情况，方便调试
-    df_cleaned.groupBy("failure").count().show()
+    df_spark.groupBy("failure").count().show()
+    logging.info(f"清洗后的数据量: {df_spark.count()}")
 
-    # 保留 failure 列不为空的记录
-    df_cleaned = df_cleaned.filter(F.col("failure").isNotNull())
-    logging.info(f"过滤非空 failure 列后的数据量: {df_cleaned.count()}")
-
-    # 去重
-    df_cleaned = df_cleaned.dropDuplicates(["date", "serial_number", "model", "failure"])
-    logging.info(f"去重后的数据量: {df_cleaned.count()}")
-
-    # 将数据分批插入 PostgreSQL
+    # 将清洗后的数据分批插入 PostgreSQL
     batch_size = 10000
-    df_cleaned_pandas = df_cleaned.toPandas()
+    df_cleaned_pandas = df_spark.select("date", "serial_number", "model", "failure").toPandas()
 
-    # 创建或清空 cleaned_data 表, 并独立提交表结构的更改
+    # 创建或清空 cleaned_data 表
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS cleaned_data")
         cur.execute("""
@@ -263,7 +241,7 @@ def analyze_daily_data(**kwargs):
     query = "SELECT date, serial_number, failure FROM cleaned_data"
     df_postgres = pd.read_sql(query, conn)
     conn.close()
-
+    logging.info(f"已读取 {len(df_postgres)} 条记录")
     spark = SparkSession.builder.appName(
         "Daily Drive Summary").config(
         "spark.driver.memory", "12g").config(
@@ -280,6 +258,7 @@ def analyze_daily_data(**kwargs):
     if os.path.exists(output_folder):
         shutil.rmtree(output_folder)
     daily_summary.write.csv(output_folder, header=True)
+    logging.info(f"已保存每日汇总数据到: {output_folder}")
     spark.stop()
 
 
@@ -288,21 +267,14 @@ def analyze_yearly_data(**kwargs):
     query = "SELECT date, serial_number, model, failure FROM cleaned_data"
     df_postgres = pd.read_sql(query, conn)
     conn.close()
-
+    logging.info(f"已读取 {len(df_postgres)} 条记录")
     # 初始化 Spark 会话
     spark = SparkSession.builder.appName("Yearly Drive Summary").config(
         "spark.driver.memory", "8g").config(
         "spark.executor.memory", "8g").getOrCreate()
 
     df_spark = spark.createDataFrame(df_postgres)
-
-    # 数据清理和品牌分类
-    df_spark = df_spark.select("date", "serial_number", "model", "failure") \
-        .dropna(subset=["date", "serial_number", "model", "failure"]) \
-        .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
-        .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
-        .dropDuplicates()
-
+    logging.info(f"已创建 Spark DataFrame: {df_spark.count()} 条记录")
     # 提取年份和品牌分类
     df_spark = df_spark.withColumn("year", F.year(F.col("date")))
 
@@ -334,6 +306,7 @@ def analyze_yearly_data(**kwargs):
 
     # 保存结果到 CSV
     yearly_summary.write.csv(output_folder, header=True)
+    logging.info(f"已保存年度汇总数据到: {output_folder}")
 
     # 关闭 Spark 会话
     spark.stop()
@@ -379,8 +352,8 @@ with DAG(
 
     # 删除表任务
     drop_table_task = PythonOperator(
-        task_id='drop_smart_data_table',
-        python_callable=drop_smart_data_table,
+        task_id='drop_driver_data_table',
+        python_callable=drop_driver_data_table,
         dag=dag,
     )
 
