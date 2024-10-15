@@ -84,6 +84,7 @@ def drop_smart_data_table(**kwargs):
         cur.execute("DROP TABLE IF EXISTS smart_data")
         conn.commit()
     conn.close()
+    logging.info("已删除 smart_data 表")
 
 
 # 处理 CSV 文件
@@ -113,7 +114,8 @@ def process_csv_file(file_path, **kwargs):
                     smart_1_raw BIGINT
                 )
             """)
-            conn.commit()  # 提交建表事务
+            conn.commit()
+            logging.info("已创建 smart_data 表")
 
         # 批量插入数据的操作保证在一个事务中
         with conn.cursor() as cur, open(file_path, 'r') as f:
@@ -198,24 +200,22 @@ def clean_data(**kwargs):
 
     # 分区以并行处理, 可以根据集群资源调整分区数目
     df_spark = df_spark.repartition(8)  # 假设使用 8 个分区
-
-    # 打印原始数据行数
-    print(f"原始数据量: {df_spark.count()}")
+    logging.info(f"原始数据量: {df_spark.count()}")
 
     # 移除特定列中的空值
     df_cleaned = df_spark.dropna(subset=["date", "serial_number", "model"])
-    print(f"移除空值后的数据量: {df_cleaned.count()}")
+    logging.info(f"移除空值后的数据量: {df_cleaned.count()}")
 
     # 打印 failure 列的分布情况，方便调试
     df_cleaned.groupBy("failure").count().show()
 
     # 保留 failure 列不为空的记录
     df_cleaned = df_cleaned.filter(F.col("failure").isNotNull())
-    print(f"过滤非空 failure 列后的数据量: {df_cleaned.count()}")
+    logging.info(f"过滤非空 failure 列后的数据量: {df_cleaned.count()}")
 
     # 去重
     df_cleaned = df_cleaned.dropDuplicates(["date", "serial_number", "model", "failure"])
-    print(f"去重后的数据量: {df_cleaned.count()}")
+    logging.info(f"去重后的数据量: {df_cleaned.count()}")
 
     # 将数据分批插入 PostgreSQL
     batch_size = 10000
@@ -233,32 +233,25 @@ def clean_data(**kwargs):
                 failure BIGINT
             )
         """)
-        conn.commit()  # 提交表创建的事务
+        conn.commit()
+        logging.info("已创建 cleaned_data 表")
 
     try:
         # 批量插入数据，保证所有插入操作在一个事务中
         with conn.cursor() as cur:
-            for start in range(0, len(df_cleaned_pandas), batch_size):
-                batch_data = df_cleaned_pandas[start:start + batch_size]
-                insert_data = [(row['date'], row['serial_number'], row['model'], row['failure']) for _, row in
-                               batch_data.iterrows()]
-
-                # 批量插入
+            for i in range(0, len(df_cleaned_pandas), batch_size):
+                batch = df_cleaned_pandas.iloc[i:i + batch_size]
                 cur.executemany("""
                     INSERT INTO cleaned_data (date, serial_number, model, failure)
                     VALUES (%s, %s, %s, %s)
-                """, insert_data)
+                """, batch.values.tolist())
 
-                logging.info(f"已插入 {start + len(batch_data)} 条记录")
+                logging.info(f"已插入 {i + len(batch)} 条清洗后的数据")
 
-            # 提交批量插入的事务
-            conn.commit()
-
+            conn.commit()  # 提交批量插入
     except Exception as e:
-        # 如果插入过程中发生错误，回滚事务
-        logging.error(f"插入数据时出错: {e}")
+        logging.error(f"清洗数据插入时出错: {e}")
         conn.rollback()
-
     finally:
         conn.close()
         spark.stop()
