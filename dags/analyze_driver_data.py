@@ -32,6 +32,9 @@ custom_target_base_dir = './mydata'
 # source_dir
 custom_source_dir = './original_drive_data'
 
+# result_dir
+custom_result_dir = './output'
+
 
 # 获取 PostgreSQL 连接
 def get_postgres_conn():
@@ -203,7 +206,10 @@ def analyze_daily_data(**kwargs):
     )
 
     daily_summary.show(100)
-    daily_summary.write.csv(f"output/daily_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv", header=True)
+    output_folder = f"{custom_result_dir}/daily_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+    daily_summary.write.csv(output_folder, header=True)
     spark.stop()
 
 
@@ -251,8 +257,13 @@ def analyze_yearly_data(**kwargs):
     # 显示结果
     yearly_summary.show(20)
 
+    output_folder = f"{custom_result_dir}/yearly_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    # 删除文件夹如果已经存在
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+
     # 保存结果到 CSV
-    yearly_summary.write.csv(f"output/yearly_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv", header=True)
+    yearly_summary.write.csv(output_folder, header=True)
 
     # 关闭 Spark 会话
     spark.stop()
