@@ -47,9 +47,19 @@ def get_postgres_conn():
     )
 
 
+def remove_macosx_dirs(target_dir):
+    """递归删除所有 __MACOSX 文件夹"""
+    for root, dirs, files in os.walk(target_dir):
+        if "__MACOSX" in dirs:
+            macosx_path = os.path.join(root, "__MACOSX")
+            shutil.rmtree(macosx_path)
+            logging.info(f"已删除 __MACOSX 文件夹: {macosx_path}")
+
+
 # 解压缩文件
 def unzip_files(source_dir=custom_source_dir, target_base_dir=custom_target_base_dir, **kwargs):
     os.makedirs(target_base_dir, exist_ok=True)
+
     for filename in os.listdir(source_dir):
         if filename.endswith('.zip'):
             zip_path = os.path.join(source_dir, filename)
@@ -63,6 +73,9 @@ def unzip_files(source_dir=custom_source_dir, target_base_dir=custom_target_base
                 zip_ref.extractall(target_dir)
                 logging.info(f"解压完成: {zip_path} 到 {target_dir}")
 
+            # 递归删除所有层级的 __MACOSX 文件夹
+            remove_macosx_dirs(target_dir)
+
 
 # 删除表的函数
 def drop_smart_data_table(**kwargs):
@@ -73,6 +86,7 @@ def drop_smart_data_table(**kwargs):
     conn.close()
 
 
+# 处理 CSV 文件
 def process_csv_file(file_path, **kwargs):
     conn = get_postgres_conn()
     file_name = os.path.basename(file_path)
@@ -102,19 +116,58 @@ def process_csv_file(file_path, **kwargs):
             )
         """)
 
+        # 设置批量大小
+        batch_size = 1000
+        batch_data = []
+        insert_count = 0  # 记录总插入数
+
         for row in reader:
-            row = [None if v == '' else v for v in row]
-            cur.execute("""
+            row = [None if v == '' else v for v in row]  # 替换空值为 None
+            batch_data.append((
+                file_date, row[1], row[2],
+                int(row[3]) if row[3] else None,
+                int(row[4]) if row[4] else None,
+                row[5],
+                int(row[6]) if row[6] else None,
+                int(row[7]) if row[7] else None,
+                int(row[8]) if row[8] else None,
+                int(row[9]) if row[9] else None,
+                row[10] == 'True',
+                int(row[11]) if row[11] else None,
+                int(row[12]) if row[12] else None
+            ))
+
+            # 如果批量数据达到了指定的大小，就插入并记录日志
+            if len(batch_data) >= batch_size:
+                cur.executemany("""
+                    INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
+                                            cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
+                                            smart_1_normalized, smart_1_raw)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, batch_data)
+                conn.commit()
+
+                # 记录批次日志
+                insert_count += len(batch_data)
+                logging.info(f"已插入 {len(batch_data)} 条记录，总插入数: {insert_count}")
+
+                # 清空批次数据
+                batch_data = []
+
+        # 插入剩余的批次数据
+        if batch_data:
+            cur.executemany("""
                 INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
                                         cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
                                         smart_1_normalized, smart_1_raw)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (file_date, row[1], row[2], int(row[3]) if row[3] else None, int(row[4]) if row[4] else None,
-                  row[5], int(row[6]) if row[6] else None, int(row[7]) if row[7] else None,
-                  int(row[8]) if row[8] else None, int(row[9]) if row[9] else None,
-                  row[10] == 'True', int(row[11]) if row[11] else None, int(row[12]) if row[12] else None))
+            """, batch_data)
+            conn.commit()
 
-        conn.commit()
+            # 记录最后一批日志
+            insert_count += len(batch_data)
+            logging.info(f"已插入剩余 {len(batch_data)} 条记录，总插入数: {insert_count}")
+
     conn.close()
 
 
@@ -123,7 +176,7 @@ def find_csv_files(target_dir='mydata', **kwargs):
     return glob.glob(f'{target_dir}/**/*.csv', recursive=True)
 
 
-# 清洗数据
+# 清洗数据函数
 def clean_data(**kwargs):
     conn = get_postgres_conn()
 
@@ -136,7 +189,12 @@ def clean_data(**kwargs):
         "Data Cleaning").config(
         "spark.driver.memory", "8g").config(
         "spark.executor.memory", "8g").getOrCreate()
+
+    # 加载数据到 Spark DataFrame
     df_spark = spark.createDataFrame(df_postgres)
+
+    # 分区以并行处理, 可以根据集群资源调整分区数目
+    df_spark = df_spark.repartition(8)  # 假设使用 8 个分区
 
     # 打印原始数据行数
     print(f"原始数据量: {df_spark.count()}")
@@ -149,38 +207,43 @@ def clean_data(**kwargs):
     df_cleaned.groupBy("failure").count().show()
 
     # 保留 failure 列不为空的记录
-    df_cleaned = df_cleaned.filter(col("failure").isNotNull())
+    df_cleaned = df_cleaned.filter(F.col("failure").isNotNull())
     print(f"过滤非空 failure 列后的数据量: {df_cleaned.count()}")
 
     # 去重
     df_cleaned = df_cleaned.dropDuplicates(["date", "serial_number", "model", "failure"])
     print(f"去重后的数据量: {df_cleaned.count()}")
 
-    # 将数据转换为 Pandas DataFrame 以插入 PostgreSQL
+    # 将数据分批插入 PostgreSQL
+    batch_size = 10000
     df_cleaned_pandas = df_cleaned.toPandas()
 
     # 创建或清空 cleaned_data 表
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS cleaned_data")
-
         cur.execute("""
-                   CREATE TABLE IF NOT EXISTS cleaned_data (
-                       id SERIAL PRIMARY KEY,
-                       date DATE,
-                       serial_number VARCHAR(255),
-                       model VARCHAR(255),
-                       failure BIGINT
-                   )
-               """)
+            CREATE TABLE IF NOT EXISTS cleaned_data (
+                id SERIAL PRIMARY KEY,
+                date DATE,
+                serial_number VARCHAR(255),
+                model VARCHAR(255),
+                failure BIGINT
+            )
+        """)
 
-        # 插入数据
-        for index, row in df_cleaned_pandas.iterrows():
-            cur.execute("""
+        # 分批次插入数据
+        for start in range(0, len(df_cleaned_pandas), batch_size):
+            batch_data = df_cleaned_pandas[start:start + batch_size]
+            insert_data = [(row['date'], row['serial_number'], row['model'], row['failure']) for _, row in
+                           batch_data.iterrows()]
+
+            # 批量插入
+            cur.executemany("""
                 INSERT INTO cleaned_data (date, serial_number, model, failure)
                 VALUES (%s, %s, %s, %s)
-            """, (row['date'], row['serial_number'], row['model'], row['failure']))
-            if index % 10000 == 0:
-                logging.info(f"已插入 {index} 条记录")
+            """, insert_data)
+
+            logging.info(f"已插入 {start + len(batch_data)} 条记录")
         conn.commit()
 
     conn.close()
