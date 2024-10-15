@@ -6,7 +6,8 @@ import csv
 import os
 import psycopg
 import glob
-import pendulum
+import shutil
+import zipfile
 from airflow.utils.dates import days_ago
 
 # PostgreSQL 连接设置
@@ -26,6 +27,50 @@ default_args = {
     'retry_delay': dt.timedelta(minutes=2),
     'execution_timeout': dt.timedelta(minutes=1),  # 设置任务超时时间
 }
+
+# 解压缩文件的函数
+def unzip_files(**kwargs):
+    source_dir = './original_drive_data'  # 压缩文件所在目录
+    target_base_dir = './mydata'  # 解压缩目标基础目录
+
+    # 确保目标基础目录存在
+    os.makedirs(target_base_dir, exist_ok=True)
+
+    # 遍历 source_dir 中的所有 zip 文件
+    for filename in os.listdir(source_dir):
+        if filename.endswith('.zip'):
+            zip_path = os.path.join(source_dir, filename)
+            zip_name = os.path.splitext(filename)[0]  # 获取不带扩展名的文件名
+            target_dir = os.path.join(target_base_dir, zip_name)  # 目标文件夹以 zip 文件名命名
+
+            # 如果目标目录存在，删除旧目录及内容
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+
+            # 确保解压目录存在
+            os.makedirs(target_dir, exist_ok=True)
+
+            # 打开 zip 文件
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # 获取 zip 文件中的所有文件名
+                for member in zip_ref.namelist():
+                    # 跳过 __MACOSX 文件夹及其内容
+                    if member.startswith('__MACOSX/'):
+                        continue
+
+                    # 构造解压目标路径
+                    target_file_path = os.path.join(target_dir, member)
+                    target_folder = os.path.dirname(target_file_path)
+
+                    # 如果目标文件是目录，确保目录存在
+                    if not os.path.exists(target_folder):
+                        os.makedirs(target_folder, exist_ok=True)
+
+                    # 解压文件
+                    with zip_ref.open(member) as source, open(target_file_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+
+    print("所有 zip 文件已解压到以 zip 文件名命名的文件夹，__MACOSX 文件夹已被跳过。")
 
 
 # CSV 文件处理函数
@@ -89,16 +134,22 @@ with DAG(
         default_args=default_args,
         catchup=False,
         schedule_interval=None,  # 禁止调度
-        dagrun_timeout=dt.timedelta(minutes=60),
+        dagrun_timeout=dt.timedelta(days=1),
         tags=['load', 'csv', 'postgresql', 'practice'],
 ) as dag:
+    # 解压 zip 文件的任务
+    unzip_task = PythonOperator(
+        task_id='unzip_files',
+        python_callable=unzip_files,
+        provide_context=True
+    )
+
     # 搜索 CSV 文件的任务
     search_csv_task = PythonOperator(
         task_id='search_csv_files',
         python_callable=find_csv_files,
         provide_context=True
     )
-
 
     # 导入每个 CSV 文件的任务
     def create_csv_import_tasks(file_path):
@@ -109,10 +160,9 @@ with DAG(
             provide_context=True
         )
 
-
-    # 动态生成 CSV 处理任务
+    # 解压 -> 搜索 CSV 文件 -> 处理 CSV 文件
     csv_files = find_csv_files()
     process_csv_tasks = [create_csv_import_tasks(file) for file in csv_files]
 
     # 设置任务依赖
-    search_csv_task >> process_csv_tasks
+    unzip_task >> search_csv_task >> process_csv_tasks
