@@ -248,11 +248,11 @@ def analyze_yearly_data(**kwargs):
     # 按年份和品牌汇总故障数
     yearly_summary = df_spark.groupBy("year", "brand").agg(
         F.sum(F.col("failure")).alias("drive_failures"),
-        F.collect_set("model").alias("models")
+        # F.collect_set("model").alias("models")
     )
 
     # 将模型列转换为逗号分隔的字符串
-    yearly_summary = yearly_summary.withColumn("models", F.concat_ws(", ", "models"))
+    # yearly_summary = yearly_summary.withColumn("models", F.concat_ws(", ", "models"))
 
     # 显示结果
     yearly_summary.show(20)
