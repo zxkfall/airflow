@@ -92,83 +92,86 @@ def process_csv_file(file_path, **kwargs):
     file_name = os.path.basename(file_path)
     file_date = datetime.strptime(file_name.split(".")[0], '%Y-%m-%d').date()
 
-    with conn.cursor() as cur, open(file_path, 'r') as f:
-        reader = csv.reader(f)
-        headers = next(reader)  # 跳过标题行
+    try:
+        # 创建表的操作单独放在一个事务中
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS smart_data (
+                    id SERIAL PRIMARY KEY,
+                    date DATE,
+                    serial_number VARCHAR(255),
+                    model VARCHAR(255),
+                    capacity_bytes BIGINT,
+                    failure BIGINT,
+                    datacenter VARCHAR(255),
+                    cluster_id BIGINT,
+                    vault_id BIGINT,
+                    pod_id BIGINT,
+                    pod_slot_num BIGINT,
+                    is_legacy_format BOOLEAN,
+                    smart_1_normalized BIGINT,
+                    smart_1_raw BIGINT
+                )
+            """)
+            conn.commit()  # 提交建表事务
 
-        # 只在表不存在时创建表
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS smart_data (
-                id SERIAL PRIMARY KEY,
-                date DATE,
-                serial_number VARCHAR(255),
-                model VARCHAR(255),
-                capacity_bytes BIGINT,
-                failure BIGINT,
-                datacenter VARCHAR(255),
-                cluster_id BIGINT,
-                vault_id BIGINT,
-                pod_id BIGINT,
-                pod_slot_num BIGINT,
-                is_legacy_format BOOLEAN,
-                smart_1_normalized BIGINT,
-                smart_1_raw BIGINT
-            )
-        """)
+        # 批量插入数据的操作保证在一个事务中
+        with conn.cursor() as cur, open(file_path, 'r') as f:
+            reader = csv.reader(f)
+            headers = next(reader)  # 跳过标题行
 
-        # 设置批量大小
-        batch_size = 1000
-        batch_data = []
-        insert_count = 0  # 记录总插入数
+            batch_size = 1000
+            batch_data = []
+            insert_count = 0  # 记录总插入数
 
-        for row in reader:
-            row = [None if v == '' else v for v in row]  # 替换空值为 None
-            batch_data.append((
-                file_date, row[1], row[2],
-                int(row[3]) if row[3] else None,
-                int(row[4]) if row[4] else None,
-                row[5],
-                int(row[6]) if row[6] else None,
-                int(row[7]) if row[7] else None,
-                int(row[8]) if row[8] else None,
-                int(row[9]) if row[9] else None,
-                row[10] == 'True',
-                int(row[11]) if row[11] else None,
-                int(row[12]) if row[12] else None
-            ))
+            for row in reader:
+                row = [None if v == '' else v for v in row]  # 替换空值为 None
+                batch_data.append((
+                    file_date, row[1], row[2],
+                    int(row[3]) if row[3] else None,
+                    int(row[4]) if row[4] else None,
+                    row[5],
+                    int(row[6]) if row[6] else None,
+                    int(row[7]) if row[7] else None,
+                    int(row[8]) if row[8] else None,
+                    int(row[9]) if row[9] else None,
+                    row[10] == 'True',
+                    int(row[11]) if row[11] else None,
+                    int(row[12]) if row[12] else None
+                ))
 
-            # 如果批量数据达到了指定的大小，就插入并记录日志
-            if len(batch_data) >= batch_size:
+                if len(batch_data) >= batch_size:
+                    cur.executemany("""
+                        INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
+                                                cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
+                                                smart_1_normalized, smart_1_raw)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, batch_data)
+
+                    insert_count += len(batch_data)
+                    logging.info(f"已插入 {len(batch_data)} 条记录，总插入数: {insert_count}")
+                    batch_data = []
+
+            # 插入剩余的批次数据
+            if batch_data:
                 cur.executemany("""
                     INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
                                             cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
                                             smart_1_normalized, smart_1_raw)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, batch_data)
-                conn.commit()
 
-                # 记录批次日志
                 insert_count += len(batch_data)
-                logging.info(f"已插入 {len(batch_data)} 条记录，总插入数: {insert_count}")
+                logging.info(f"已插入剩余 {len(batch_data)} 条记录，总插入数: {insert_count}")
 
-                # 清空批次数据
-                batch_data = []
+            conn.commit()  # 提交插入事务
 
-        # 插入剩余的批次数据
-        if batch_data:
-            cur.executemany("""
-                INSERT INTO smart_data (date, serial_number, model, capacity_bytes, failure, datacenter, 
-                                        cluster_id, vault_id, pod_id, pod_slot_num, is_legacy_format, 
-                                        smart_1_normalized, smart_1_raw)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, batch_data)
-            conn.commit()
+    except Exception as e:
+        logging.error(f"处理文件 {file_name} 时出错: {e}")
+        conn.rollback()  # 如果发生错误，回滚事务
 
-            # 记录最后一批日志
-            insert_count += len(batch_data)
-            logging.info(f"已插入剩余 {len(batch_data)} 条记录，总插入数: {insert_count}")
-
-    conn.close()
+    finally:
+        conn.close()
 
 
 # 搜索 CSV 文件
@@ -218,7 +221,7 @@ def clean_data(**kwargs):
     batch_size = 10000
     df_cleaned_pandas = df_cleaned.toPandas()
 
-    # 创建或清空 cleaned_data 表
+    # 创建或清空 cleaned_data 表, 并独立提交表结构的更改
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS cleaned_data")
         cur.execute("""
@@ -230,24 +233,35 @@ def clean_data(**kwargs):
                 failure BIGINT
             )
         """)
+        conn.commit()  # 提交表创建的事务
 
-        # 分批次插入数据
-        for start in range(0, len(df_cleaned_pandas), batch_size):
-            batch_data = df_cleaned_pandas[start:start + batch_size]
-            insert_data = [(row['date'], row['serial_number'], row['model'], row['failure']) for _, row in
-                           batch_data.iterrows()]
+    try:
+        # 批量插入数据，保证所有插入操作在一个事务中
+        with conn.cursor() as cur:
+            for start in range(0, len(df_cleaned_pandas), batch_size):
+                batch_data = df_cleaned_pandas[start:start + batch_size]
+                insert_data = [(row['date'], row['serial_number'], row['model'], row['failure']) for _, row in
+                               batch_data.iterrows()]
 
-            # 批量插入
-            cur.executemany("""
-                INSERT INTO cleaned_data (date, serial_number, model, failure)
-                VALUES (%s, %s, %s, %s)
-            """, insert_data)
+                # 批量插入
+                cur.executemany("""
+                    INSERT INTO cleaned_data (date, serial_number, model, failure)
+                    VALUES (%s, %s, %s, %s)
+                """, insert_data)
 
-            logging.info(f"已插入 {start + len(batch_data)} 条记录")
-        conn.commit()
+                logging.info(f"已插入 {start + len(batch_data)} 条记录")
 
-    conn.close()
-    spark.stop()
+            # 提交批量插入的事务
+            conn.commit()
+
+    except Exception as e:
+        # 如果插入过程中发生错误，回滚事务
+        logging.error(f"插入数据时出错: {e}")
+        conn.rollback()
+
+    finally:
+        conn.close()
+        spark.stop()
 
 
 # Daily 分析
