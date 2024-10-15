@@ -1,18 +1,21 @@
 import csv
+import datetime as dt
+import glob
+import logging
 import os
 import shutil
 import zipfile
-import glob
+from datetime import datetime
+
 import pandas as pd
 import psycopg
-from datetime import datetime
 from airflow import DAG
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.utils.dates import days_ago
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, sum, year
-import logging
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, count, sum
 
 # sqlalchemy 连接设置
 conn_params = {
@@ -58,7 +61,15 @@ def unzip_files(source_dir=custom_source_dir, target_base_dir=custom_target_base
                 logging.info(f"解压完成: {zip_path} 到 {target_dir}")
 
 
-# 处理 CSV 文件并写入数据库
+# 删除表的函数
+def drop_smart_data_table(**kwargs):
+    conn = get_postgres_conn()
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS smart_data")
+        conn.commit()
+    conn.close()
+
+
 def process_csv_file(file_path, **kwargs):
     conn = get_postgres_conn()
     file_name = os.path.basename(file_path)
@@ -68,27 +79,25 @@ def process_csv_file(file_path, **kwargs):
         reader = csv.reader(f)
         headers = next(reader)  # 跳过标题行
 
-        # drop if existed
-        cur.execute("DROP TABLE IF EXISTS smart_data")
-        # ensure table existed
+        # 只在表不存在时创建表
         cur.execute("""
-                CREATE TABLE IF NOT EXISTS smart_data (
-                    id SERIAL PRIMARY KEY,
-                    date DATE,
-                    serial_number VARCHAR(255),
-                    model VARCHAR(255),
-                    capacity_bytes BIGINT,
-                    failure BIGINT,
-                    datacenter VARCHAR(255),
-                    cluster_id BIGINT,
-                    vault_id BIGINT,
-                    pod_id BIGINT,
-                    pod_slot_num BIGINT,
-                    is_legacy_format BOOLEAN,
-                    smart_1_normalized BIGINT,
-                    smart_1_raw BIGINT
-                )
-            """)
+            CREATE TABLE IF NOT EXISTS smart_data (
+                id SERIAL PRIMARY KEY,
+                date DATE,
+                serial_number VARCHAR(255),
+                model VARCHAR(255),
+                capacity_bytes BIGINT,
+                failure BIGINT,
+                datacenter VARCHAR(255),
+                cluster_id BIGINT,
+                vault_id BIGINT,
+                pod_id BIGINT,
+                pod_slot_num BIGINT,
+                is_legacy_format BOOLEAN,
+                smart_1_normalized BIGINT,
+                smart_1_raw BIGINT
+            )
+        """)
 
         for row in reader:
             row = [None if v == '' else v for v in row]
@@ -114,25 +123,43 @@ def find_csv_files(target_dir='mydata', **kwargs):
 # 清洗数据
 def clean_data(**kwargs):
     conn = get_postgres_conn()
+
+    # 查询所有数据
     query = "SELECT date, serial_number, model, failure FROM smart_data"
     df_postgres = pd.read_sql(query, conn)
-    conn.close()
 
-    spark = SparkSession.builder.appName("Data Cleaning").getOrCreate()
+    # 创建 SparkSession
+    spark = SparkSession.builder.appName(
+        "Data Cleaning").config(
+        "spark.driver.memory", "8g").config(
+        "spark.executor.memory", "8g").getOrCreate()
     df_spark = spark.createDataFrame(df_postgres)
 
-    df_cleaned = df_spark.select("date", "serial_number", "model", "failure") \
-        .dropna() \
-        .filter(col("failure").isin(0, 1)) \
-        .dropDuplicates()
+    # 打印原始数据行数
+    print(f"原始数据量: {df_spark.count()}")
 
+    # 移除特定列中的空值
+    df_cleaned = df_spark.dropna(subset=["date", "serial_number", "model"])
+    print(f"移除空值后的数据量: {df_cleaned.count()}")
+
+    # 打印 failure 列的分布情况，方便调试
+    df_cleaned.groupBy("failure").count().show()
+
+    # 保留 failure 列不为空的记录
+    df_cleaned = df_cleaned.filter(col("failure").isNotNull())
+    print(f"过滤非空 failure 列后的数据量: {df_cleaned.count()}")
+
+    # 去重
+    df_cleaned = df_cleaned.dropDuplicates(["date", "serial_number", "model", "failure"])
+    print(f"去重后的数据量: {df_cleaned.count()}")
+
+    # 将数据转换为 Pandas DataFrame 以插入 PostgreSQL
     df_cleaned_pandas = df_cleaned.toPandas()
 
+    # 创建或清空 cleaned_data 表
     with conn.cursor() as cur:
-        # drop if existed
         cur.execute("DROP TABLE IF EXISTS cleaned_data")
 
-        # ensure table existed
         cur.execute("""
                    CREATE TABLE IF NOT EXISTS cleaned_data (
                        id SERIAL PRIMARY KEY,
@@ -143,12 +170,16 @@ def clean_data(**kwargs):
                    )
                """)
 
+        # 插入数据
         for index, row in df_cleaned_pandas.iterrows():
             cur.execute("""
                 INSERT INTO cleaned_data (date, serial_number, model, failure)
                 VALUES (%s, %s, %s, %s)
             """, (row['date'], row['serial_number'], row['model'], row['failure']))
+            if index % 10000 == 0:
+                logging.info(f"已插入 {index} 条记录")
         conn.commit()
+
     conn.close()
     spark.stop()
 
@@ -160,7 +191,10 @@ def analyze_daily_data(**kwargs):
     df_postgres = pd.read_sql(query, conn)
     conn.close()
 
-    spark = SparkSession.builder.appName("Daily Drive Summary").getOrCreate()
+    spark = SparkSession.builder.appName(
+        "Daily Drive Summary").config(
+        "spark.driver.memory", "12g").config(
+        "spark.executor.memory", "12g").getOrCreate()
     df_spark = spark.createDataFrame(df_postgres)
 
     daily_summary = df_spark.groupBy("date").agg(
@@ -168,33 +202,72 @@ def analyze_daily_data(**kwargs):
         sum(col("failure")).alias("drive_failures")
     )
 
-    daily_summary.write.csv("output/daily_summary.csv", header=True)
+    daily_summary.show(100)
+    daily_summary.write.csv(f"output/daily_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv", header=True)
     spark.stop()
 
 
-# Yearly 分析
 def analyze_yearly_data(**kwargs):
     conn = get_postgres_conn()
     query = "SELECT date, serial_number, model, failure FROM cleaned_data"
     df_postgres = pd.read_sql(query, conn)
     conn.close()
 
-    spark = SparkSession.builder.appName("Yearly Drive Summary").getOrCreate()
+    # 初始化 Spark 会话
+    spark = SparkSession.builder.appName("Yearly Drive Summary").config(
+        "spark.driver.memory", "8g").config(
+        "spark.executor.memory", "8g").getOrCreate()
+
     df_spark = spark.createDataFrame(df_postgres)
 
-    df_spark = df_spark.withColumn("year", year("date"))
-    yearly_summary = df_spark.groupBy("year", "model").agg(
-        sum("failure").alias("drive_failures")
+    # 数据清理和品牌分类
+    df_spark = df_spark.select("date", "serial_number", "model", "failure") \
+        .dropna(subset=["date", "serial_number", "model", "failure"]) \
+        .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
+        .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
+        .dropDuplicates()
+
+    # 提取年份和品牌分类
+    df_spark = df_spark.withColumn("year", F.year(F.col("date")))
+
+    df_spark = df_spark.withColumn("brand", F.when(df_spark.model.startswith("CT"), "Crucial")
+                                   .when(df_spark.model.startswith("DELLBOSS"), "Dell BOSS")
+                                   .when(df_spark.model.startswith("HGST"), "HGST")
+                                   .when(df_spark.model.startswith("Seagate"), "Seagate")
+                                   .when(df_spark.model.startswith("ST"), "Seagate")
+                                   .when(df_spark.model.startswith("TOSHIBA"), "Toshiba")
+                                   .when(df_spark.model.startswith("WDC"), "Western Digital")
+                                   .otherwise("Others"))
+
+    # 按年份和品牌汇总故障数
+    yearly_summary = df_spark.groupBy("year", "brand").agg(
+        F.sum(F.col("failure")).alias("drive_failures"),
+        F.collect_set("model").alias("models")
     )
 
-    yearly_summary.write.csv("output/yearly_summary.csv", header=True)
+    # 将模型列转换为逗号分隔的字符串
+    yearly_summary = yearly_summary.withColumn("models", F.concat_ws(", ", "models"))
+
+    # 显示结果
+    yearly_summary.show(20)
+
+    # 保存结果到 CSV
+    yearly_summary.write.csv(f"output/yearly_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv", header=True)
+
+    # 关闭 Spark 会话
     spark.stop()
 
 
 # 支持多选的分析任务
 def choose_analysis(**kwargs):
-    analysis_types = kwargs['dag_run'].conf.get('analysis_type', ['daily'])
-    return ['analyze_daily_data'] if 'daily' in analysis_types else ['analyze_yearly_data']
+    analysis_types = kwargs['dag_run'].conf.get('analysis_types', ['daily'])
+    logging.info(f"选择的分析类型: {analysis_types}")
+    if 'daily' in analysis_types and 'yearly' in analysis_types:
+        return ['analyze_daily_data', 'analyze_yearly_data']
+    elif 'yearly' in analysis_types and 'daily' not in analysis_types:
+        return ['analyze_yearly_data']
+    else:
+        return ['analyze_daily_data']
 
 
 # 定义 DAG
@@ -204,10 +277,12 @@ with DAG(
             'owner': 'airflow',
             'start_date': days_ago(1),
             'retries': 1,
-            'retry_delay': pd.Timedelta(minutes=1)
+            'retry_delay': dt.timedelta(minutes=2),
+            'execution_timeout': dt.timedelta(hours=4),  # 设置任务超时时间
         },
         catchup=False,
         schedule_interval=None,
+        dagrun_timeout=dt.timedelta(days=1),
         tags=['data_analysis', 'practice', 'driver_data', 'daily', 'yearly'],
         params={'analysis_types': ['daily', 'yearly']}
 ) as dag:
@@ -219,6 +294,13 @@ with DAG(
     search_csv_task = PythonOperator(
         task_id='search_csv_files',
         python_callable=find_csv_files
+    )
+
+    # 删除表任务
+    drop_table_task = PythonOperator(
+        task_id='drop_smart_data_table',
+        python_callable=drop_smart_data_table,
+        dag=dag,
     )
 
     # 并发处理每个 CSV 文件
@@ -253,6 +335,6 @@ with DAG(
 
     end_task = EmptyOperator(task_id='end')
 
-    unzip_task >> search_csv_task >> process_csv_tasks >> clean_data_task
+    unzip_task >> search_csv_task >> drop_table_task >> process_csv_tasks >> clean_data_task
     clean_data_task >> branch_task >> [analyze_daily_task, analyze_yearly_task]
     [analyze_daily_task, analyze_yearly_task] >> end_task
