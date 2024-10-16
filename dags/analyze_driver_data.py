@@ -160,7 +160,10 @@ def process_csv_file(file_path, **kwargs):
 
 # 搜索 CSV 文件
 def find_csv_files(target_dir='mydata', **kwargs):
-    return glob.glob(f'{target_dir}/**/*.csv', recursive=True)
+    files = glob.glob(f'{target_dir}/**/*.csv', recursive=True)
+    logging.info(f"找到 {len(files)} 个 CSV 文件")
+    files.sort(key=lambda x: os.path.basename(x)[:10])
+    return files
 
 
 # 清洗数据函数
