@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import zipfile
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 import psycopg
@@ -89,10 +89,18 @@ def drop_driver_data_table(**kwargs):
 
 # 处理 CSV 文件
 def process_csv_file(file_path, **kwargs):
-    conn = get_postgres_conn()
     file_name = os.path.basename(file_path)
     file_date = datetime.strptime(file_name.split(".")[0], '%Y-%m-%d').date()
+    # 定义时间范围
+    start_date = date(2019, 1, 1)  # 2019年Q1的开始
+    end_date = date(2023, 9, 30)  # 2023年Q3的结束
 
+    # 检查日期是否在范围内
+    if not (start_date <= file_date <= end_date):
+        logging.info(f"{file_date} 超出时间范围，返回。")
+        return
+
+    conn = get_postgres_conn()
     try:
         # 创建表的操作单独放在一个事务中
         with conn.cursor() as cur:
@@ -411,7 +419,7 @@ with (DAG(
             'start_date': days_ago(1),
             'retries': 1,
             'retry_delay': dt.timedelta(seconds=20),
-            'execution_timeout': dt.timedelta(hours=4),  # 设置任务超时时间
+            'execution_timeout': dt.timedelta(hours=8),  # 设置任务超时时间
         },
         catchup=False,
         schedule_interval=None,
