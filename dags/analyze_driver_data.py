@@ -102,8 +102,7 @@ def process_csv_file(file_path, **kwargs):
                     date DATE,
                     serial_number VARCHAR(255),
                     model VARCHAR(255),
-                    capacity_bytes BIGINT,
-                    failure BIGINT
+                    failure INT
                 )
             """)
             conn.commit()
@@ -124,14 +123,13 @@ def process_csv_file(file_path, **kwargs):
                     file_date,
                     row[1],
                     row[2],
-                    int(row[3]) if row[3] else None,
                     int(row[4]) if row[4] else None,
                 ))
 
                 if len(batch_data) >= batch_size:
                     cur.executemany("""
-                        INSERT INTO driver_data (date, serial_number, model, capacity_bytes, failure)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO driver_data (date, serial_number, model, failure)
+                        VALUES (%s, %s, %s, %s)
                     """, batch_data)
 
                     insert_count += len(batch_data)
@@ -141,8 +139,8 @@ def process_csv_file(file_path, **kwargs):
             # 插入剩余的批次数据
             if batch_data:
                 cur.executemany("""
-                    INSERT INTO driver_data (date, serial_number, model, capacity_bytes, failure)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO driver_data (date, serial_number, model, failure)
+                    VALUES (%s, %s, %s, %s)
                 """, batch_data)
 
                 insert_count += len(batch_data)
@@ -158,90 +156,101 @@ def process_csv_file(file_path, **kwargs):
         conn.close()
 
 
-# 搜索 CSV 文件
-def find_csv_files(target_dir='mydata', **kwargs):
-    files = glob.glob(f'{target_dir}/**/*.csv', recursive=True)
-    logging.info(f"找到 {len(files)} 个 CSV 文件")
-    files.sort(key=lambda x: os.path.basename(x)[:10])
-    return files
-
-
-# 清洗数据函数
-def clean_data(**kwargs):
+def clear_clean_data_table(**kwargs):
     conn = get_postgres_conn()
-
-    # 查询所有数据
-    query = "SELECT date, serial_number, model, failure FROM driver_data"
-    df_postgres = pd.read_sql(query, conn)
-
-    # 创建 SparkSession
-    spark = SparkSession.builder.appName(
-        "Data Cleaning").config(
-        "spark.driver.memory", "8g").config(
-        "spark.executor.memory", "8g").getOrCreate()
-
-    # 加载数据到 Spark DataFrame
-    df_spark = spark.createDataFrame(df_postgres)
-
-    # 分区以并行处理, 可以根据集群资源调整分区数目
-    df_spark = df_spark.repartition(8)
-    logging.info(f"原始数据量: {df_spark.count()}")
-
-    # 数据清理和品牌分类
-    df_spark = df_spark.select("date", "serial_number", "model", "failure") \
-        .dropna(subset=["date", "serial_number", "model", "failure"]) \
-        .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
-        .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
-        .dropDuplicates()
-
-    # 打印 failure 列的分布情况，方便调试
-    df_spark.groupBy("failure").count().show()
-    logging.info(f"清洗后的数据量: {df_spark.count()}")
-
-    # 将清洗后的数据分批插入 PostgreSQL
-    batch_size = 10000
-    df_cleaned_pandas = df_spark.select("date", "serial_number", "model", "failure").toPandas()
-
-    # 创建或清空 cleaned_data 表
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS cleaned_data")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS cleaned_data (
-                id SERIAL PRIMARY KEY,
-                date DATE,
-                serial_number VARCHAR(255),
-                model VARCHAR(255),
-                failure BIGINT
-            )
-        """)
+                           CREATE TABLE IF NOT EXISTS cleaned_data (
+                               id SERIAL PRIMARY KEY,
+                               date DATE,
+                               serial_number VARCHAR(255),
+                               model VARCHAR(255),
+                               failure BIGINT
+                           )
+                       """)
         conn.commit()
-        logging.info("已创建 cleaned_data 表")
+        logging.info("已删除并创建 cleaned_data 表")
+    conn.close()
 
-    try:
-        # 批量插入数据，保证所有插入操作在一个事务中
-        with conn.cursor() as cur:
-            for i in range(0, len(df_cleaned_pandas), batch_size):
-                batch = df_cleaned_pandas.iloc[i:i + batch_size]
-                cur.executemany("""
-                    INSERT INTO cleaned_data (date, serial_number, model, failure)
-                    VALUES (%s, %s, %s, %s)
-                """, batch.values.tolist())
 
-                logging.info(f"已插入 {i + len(batch)} 条清洗后的数据")
-
-            conn.commit()  # 提交批量插入
-    except Exception as e:
-        logging.error(f"清洗数据插入时出错: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-        spark.stop()
+# 清洗数据函数
+# def clean_data(**kwargs):
+#     conn = get_postgres_conn()
+#
+#     logging.info("开始清洗数据")
+#     # 查询所有数据
+#     query = "SELECT date, serial_number, model, failure FROM driver_data"
+#     df_postgres = pd.read_sql(query, conn)
+#     logging.info(f"已读取 {len(df_postgres)} 条记录")
+#
+#     # 创建 SparkSession
+#     spark = SparkSession.builder.appName(
+#         "Data Cleaning").config(
+#         "spark.driver.memory", "8g").config(
+#         "spark.executor.memory", "8g").getOrCreate()
+#
+#     # 加载数据到 Spark DataFrame
+#     df_spark = spark.createDataFrame(df_postgres)
+#
+#     # 分区以并行处理, 可以根据集群资源调整分区数目
+#     df_spark = df_spark.repartition(8)
+#     logging.info(f"原始数据量: {df_spark.count()}")
+#
+#     # 数据清理和品牌分类
+#     df_spark = df_spark.select("date", "serial_number", "model", "failure") \
+#         .dropna(subset=["date", "serial_number", "model", "failure"]) \
+#         .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
+#         .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
+#         .dropDuplicates()
+#
+#     # 打印 failure 列的分布情况，方便调试
+#     df_spark.groupBy("failure").count().show()
+#     logging.info(f"清洗后的数据量: {df_spark.count()}")
+#
+#     # 将清洗后的数据分批插入 PostgreSQL
+#     batch_size = 10000
+#     df_cleaned_pandas = df_spark.select("date", "model", "failure").toPandas()
+#
+#     # 创建或清空 cleaned_data 表
+#     with conn.cursor() as cur:
+#         cur.execute("DROP TABLE IF EXISTS cleaned_data")
+#         cur.execute("""
+#             CREATE TABLE IF NOT EXISTS cleaned_data (
+#                 id SERIAL PRIMARY KEY,
+#                 date DATE,
+#                 model VARCHAR(255),
+#                 failure INT
+#             )
+#         """)
+#         conn.commit()
+#         logging.info("已创建 cleaned_data 表")
+#
+#     try:
+#         # 批量插入数据，保证所有插入操作在一个事务中
+#         with conn.cursor() as cur:
+#             for i in range(0, len(df_cleaned_pandas), batch_size):
+#                 batch = df_cleaned_pandas.iloc[i:i + batch_size]
+#                 cur.executemany("""
+#                     INSERT INTO cleaned_data (date, model, failure)
+#                     VALUES (%s, %s, %s)
+#                 """, batch.values.tolist())
+#
+#                 logging.info(f"已插入 {i + len(batch)} 条清洗后的数据")
+#
+#             conn.commit()  # 提交批量插入
+#     except Exception as e:
+#         logging.error(f"清洗数据插入时出错: {e}")
+#         conn.rollback()
+#     finally:
+#         conn.close()
+#         spark.stop()
 
 
 # Daily 分析
 def analyze_daily_data(**kwargs):
     conn = get_postgres_conn()
-    query = "SELECT date, serial_number, failure FROM cleaned_data"
+    query = "SELECT date, failure FROM cleaned_data"
     df_postgres = pd.read_sql(query, conn)
     conn.close()
     logging.info(f"已读取 {len(df_postgres)} 条记录")
@@ -252,7 +261,7 @@ def analyze_daily_data(**kwargs):
     df_spark = spark.createDataFrame(df_postgres)
 
     daily_summary = df_spark.groupBy("date").agg(
-        count("serial_number").alias("drive_count"),
+        count("*").alias("drive_count"),
         sum(col("failure")).alias("drive_failures")
     )
 
@@ -267,7 +276,7 @@ def analyze_daily_data(**kwargs):
 
 def analyze_yearly_data(**kwargs):
     conn = get_postgres_conn()
-    query = "SELECT date, serial_number, model, failure FROM cleaned_data"
+    query = "SELECT date, model, failure FROM cleaned_data"
     df_postgres = pd.read_sql(query, conn)
     conn.close()
     logging.info(f"已读取 {len(df_postgres)} 条记录")
@@ -327,14 +336,81 @@ def choose_analysis(**kwargs):
         return ['analyze_daily_data']
 
 
+def find_csv_files(target_dir='mydata', **kwargs):
+    files = glob.glob(f'{target_dir}/**/*.csv', recursive=True)
+    logging.info(f"找到 {len(files)} 个 CSV 文件")
+    files.sort(key=lambda x: os.path.basename(x)[:10])
+    return [[file] for file in files]
+
+
+def generate_intervals_for_month():
+    conn = get_postgres_conn()
+    total_query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM driver_data"
+    date_range = pd.read_sql(total_query, conn)
+    min_date = pd.Timestamp(date_range['min_date'].iloc[0])
+    max_date = pd.Timestamp(date_range['max_date'].iloc[0])
+    logging.info(f"日期范围: {min_date} 到 {max_date}")
+    current_date = min_date
+    intervals = []
+    while current_date <= max_date:
+        next_month = current_date + pd.DateOffset(months=1)
+        # ranges = [[]]
+        intervals.append([[current_date.strftime('%Y-%m-%d'), next_month.strftime('%Y-%m-%d')]])
+        current_date = next_month
+    logging.info(f"生成的日期范围: {intervals}")
+    return intervals
+
+
+def clean_month_data(interval):
+    logging.info(f"正在处理 {interval} 之间的数据")
+    start_date = interval[0]
+    end_date = interval[1]
+    conn = get_postgres_conn()
+
+    query = "SELECT date, serial_number, model, failure FROM driver_data WHERE date >= %s AND date < %s"
+    df_postgres = pd.read_sql(query, conn, params=(start_date, end_date))
+    if df_postgres.empty:
+        logging.info(f"在 {start_date} 和 {end_date} 之间没有数据")
+        return
+
+    logging.info(f"已读取 {len(df_postgres)} 条记录")
+    spark = SparkSession.builder.appName(
+        "Monthly Drive Summary").config(
+        "spark.driver.memory", "8g").config(
+        "spark.executor.memory", "8g").getOrCreate()
+
+    df_spark = spark.createDataFrame(df_postgres)
+    logging.info(f"已创建 Spark DataFrame: {df_spark.count()} 条记录")
+
+    df_spark = df_spark.select("date", "serial_number", "model", "failure") \
+        .dropna(subset=["date", "serial_number", "model", "failure"]) \
+        .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
+        .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
+        .dropDuplicates()
+    df_spark.groupBy("failure").count().show()
+    logging.info(f"清洗后的数据量: {df_spark.count()}")
+    batch_size = 10000
+    df_cleaned_pandas = df_spark.select("date", "model", "failure").toPandas()
+    with conn.cursor() as cur:
+        for i in range(0, len(df_cleaned_pandas), batch_size):
+            batch = df_cleaned_pandas.iloc[i:i + batch_size]
+            cur.executemany("""
+                    INSERT INTO cleaned_data (date, model, failure)
+                    VALUES (%s, %s, %s)
+                """, batch.values.tolist())
+            logging.info(f"已插入 {i + len(batch)} 条清洗后的数据")
+    conn.commit()
+    conn.close()
+
+
 # 定义 DAG
-with DAG(
+with (DAG(
         dag_id='analyze_driver_data',
         default_args={
             'owner': 'airflow',
             'start_date': days_ago(1),
             'retries': 1,
-            'retry_delay': dt.timedelta(minutes=2),
+            'retry_delay': dt.timedelta(seconds=20),
             'execution_timeout': dt.timedelta(hours=4),  # 设置任务超时时间
         },
         catchup=False,
@@ -342,15 +418,10 @@ with DAG(
         dagrun_timeout=dt.timedelta(days=1),
         tags=['data_analysis', 'practice', 'driver_data', 'daily', 'yearly'],
         params={'analysis_types': ['daily', 'yearly']}
-) as dag:
+) as dag):
     unzip_task = PythonOperator(
         task_id='unzip_files',
         python_callable=unzip_files
-    )
-
-    search_csv_task = PythonOperator(
-        task_id='search_csv_files',
-        python_callable=find_csv_files
     )
 
     # 删除表任务
@@ -360,19 +431,10 @@ with DAG(
         dag=dag,
     )
 
-    # 并发处理每个 CSV 文件
-    csv_files = find_csv_files()
-    process_csv_tasks = [
-        PythonOperator(
-            task_id=f'process_{os.path.basename(file)}',
-            python_callable=process_csv_file,
-            op_kwargs={'file_path': file}
-        ) for file in csv_files
-    ]
-
-    clean_data_task = PythonOperator(
-        task_id='clean_data',
-        python_callable=clean_data
+    drop_clean_table_task = PythonOperator(
+        task_id='drop_clean_data_table',
+        python_callable=clear_clean_data_table,
+        dag=dag,
     )
 
     branch_task = BranchPythonOperator(
@@ -392,6 +454,32 @@ with DAG(
 
     end_task = EmptyOperator(task_id='end')
 
-    unzip_task >> search_csv_task >> drop_table_task >> process_csv_tasks >> clean_data_task
-    clean_data_task >> branch_task >> [analyze_daily_task, analyze_yearly_task]
+    # 动态生成后续任务
+    process_csvs_task = PythonOperator.partial(
+        task_id='process_csvs_task',
+        python_callable=process_csv_file,
+        map_index_template="Input file_path={{ task.op_args[0] }}"
+    ).expand(op_args=find_csv_files())
+
+    # 生成输入数据的任务
+    generate_month_intervals_task = PythonOperator(
+        task_id='generate_intervals_for_month',
+        python_callable=generate_intervals_for_month,
+        # provide_context=True,
+    )
+
+    # 动态生成后续任务
+    process_month_clean_tasks = PythonOperator.partial(
+        task_id='process_month_clean_tasks',
+        python_callable=clean_month_data,
+        # op_args="{{ task_instance.xcom_pull(task_ids='generate_data')[0] }}"
+        # ).expand(op=generate_data_task.output)
+    ).expand(op_args=generate_month_intervals_task.output)
+
+    # 设置任务依赖
+    unzip_task >> drop_table_task >> process_csvs_task >> drop_clean_table_task
+
+    drop_clean_table_task >> generate_month_intervals_task >> process_month_clean_tasks >> branch_task
+
+    branch_task >> [analyze_daily_task, analyze_yearly_task]
     [analyze_daily_task, analyze_yearly_task] >> end_task
