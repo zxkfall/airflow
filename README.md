@@ -32,6 +32,13 @@ airflow
 │   ├── yearly_summary_[datetime] # yearly driver by brand failure count summary
 ```
 
+## process
+
+```zxk
+unzip zipfiles -> save data to db -> load data from db then clean data, save to db
+-> load data from db then generate daily/yearly summary, save as csv
+```
+
 ## performance
 
 - each csv file almost use 15s to process
