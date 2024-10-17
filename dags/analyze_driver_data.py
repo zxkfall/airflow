@@ -13,6 +13,7 @@ from airflow import DAG
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.utils.dates import days_ago
+from pyspark import StorageLevel
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, count, sum
@@ -85,6 +86,14 @@ def drop_driver_data_table(**kwargs):
         conn.commit()
     conn.close()
     logging.info("已删除 driver_data 表")
+
+
+# 查找 CSV 文件
+def find_csv_files(target_dir='mydata', **kwargs):
+    files = glob.glob(f'{target_dir}/**/*.csv', recursive=True)
+    logging.info(f"找到 {len(files)} 个 CSV 文件")
+    files.sort(key=lambda x: os.path.basename(x)[:10])
+    return [[file] for file in files]
 
 
 # 处理 CSV 文件
@@ -164,6 +173,7 @@ def process_csv_file(file_path, **kwargs):
         conn.close()
 
 
+# 清理中间表数据
 def clear_clean_data_table(**kwargs):
     conn = get_postgres_conn()
     with conn.cursor() as cur:
@@ -172,7 +182,6 @@ def clear_clean_data_table(**kwargs):
                            CREATE TABLE IF NOT EXISTS cleaned_data (
                                id SERIAL PRIMARY KEY,
                                date DATE,
-                               serial_number VARCHAR(255),
                                model VARCHAR(255),
                                failure BIGINT
                            )
@@ -182,175 +191,7 @@ def clear_clean_data_table(**kwargs):
     conn.close()
 
 
-# 清洗数据函数
-# def clean_data(**kwargs):
-#     conn = get_postgres_conn()
-#
-#     logging.info("开始清洗数据")
-#     # 查询所有数据
-#     query = "SELECT date, serial_number, model, failure FROM driver_data"
-#     df_postgres = pd.read_sql(query, conn)
-#     logging.info(f"已读取 {len(df_postgres)} 条记录")
-#
-#     # 创建 SparkSession
-#     spark = SparkSession.builder.appName(
-#         "Data Cleaning").config(
-#         "spark.driver.memory", "8g").config(
-#         "spark.executor.memory", "8g").getOrCreate()
-#
-#     # 加载数据到 Spark DataFrame
-#     df_spark = spark.createDataFrame(df_postgres)
-#
-#     # 分区以并行处理, 可以根据集群资源调整分区数目
-#     df_spark = df_spark.repartition(8)
-#     logging.info(f"原始数据量: {df_spark.count()}")
-#
-#     # 数据清理和品牌分类
-#     df_spark = df_spark.select("date", "serial_number", "model", "failure") \
-#         .dropna(subset=["date", "serial_number", "model", "failure"]) \
-#         .filter(F.col("date").rlike(r"\d{4}-\d{2}-\d{2}")) \
-#         .filter((F.col("failure") == 0) | (F.col("failure") == 1)) \
-#         .dropDuplicates()
-#
-#     # 打印 failure 列的分布情况，方便调试
-#     df_spark.groupBy("failure").count().show()
-#     logging.info(f"清洗后的数据量: {df_spark.count()}")
-#
-#     # 将清洗后的数据分批插入 PostgreSQL
-#     batch_size = 10000
-#     df_cleaned_pandas = df_spark.select("date", "model", "failure").toPandas()
-#
-#     # 创建或清空 cleaned_data 表
-#     with conn.cursor() as cur:
-#         cur.execute("DROP TABLE IF EXISTS cleaned_data")
-#         cur.execute("""
-#             CREATE TABLE IF NOT EXISTS cleaned_data (
-#                 id SERIAL PRIMARY KEY,
-#                 date DATE,
-#                 model VARCHAR(255),
-#                 failure INT
-#             )
-#         """)
-#         conn.commit()
-#         logging.info("已创建 cleaned_data 表")
-#
-#     try:
-#         # 批量插入数据，保证所有插入操作在一个事务中
-#         with conn.cursor() as cur:
-#             for i in range(0, len(df_cleaned_pandas), batch_size):
-#                 batch = df_cleaned_pandas.iloc[i:i + batch_size]
-#                 cur.executemany("""
-#                     INSERT INTO cleaned_data (date, model, failure)
-#                     VALUES (%s, %s, %s)
-#                 """, batch.values.tolist())
-#
-#                 logging.info(f"已插入 {i + len(batch)} 条清洗后的数据")
-#
-#             conn.commit()  # 提交批量插入
-#     except Exception as e:
-#         logging.error(f"清洗数据插入时出错: {e}")
-#         conn.rollback()
-#     finally:
-#         conn.close()
-#         spark.stop()
-
-
-# Daily 分析
-def analyze_daily_data(**kwargs):
-    conn = get_postgres_conn()
-    query = "SELECT date, failure FROM cleaned_data"
-    df_postgres = pd.read_sql(query, conn)
-    conn.close()
-    logging.info(f"已读取 {len(df_postgres)} 条记录")
-    spark = SparkSession.builder.appName(
-        "Daily Drive Summary").config(
-        "spark.driver.memory", "12g").config(
-        "spark.executor.memory", "12g").getOrCreate()
-    df_spark = spark.createDataFrame(df_postgres)
-
-    daily_summary = df_spark.groupBy("date").agg(
-        count("*").alias("drive_count"),
-        sum(col("failure")).alias("drive_failures")
-    )
-
-    daily_summary.show(100)
-    output_folder = f"{custom_result_dir}/daily_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    if os.path.exists(output_folder):
-        shutil.rmtree(output_folder)
-    daily_summary.write.csv(output_folder, header=True)
-    logging.info(f"已保存每日汇总数据到: {output_folder}")
-    spark.stop()
-
-
-def analyze_yearly_data(**kwargs):
-    conn = get_postgres_conn()
-    query = "SELECT date, model, failure FROM cleaned_data"
-    df_postgres = pd.read_sql(query, conn)
-    conn.close()
-    logging.info(f"已读取 {len(df_postgres)} 条记录")
-    # 初始化 Spark 会话
-    spark = SparkSession.builder.appName("Yearly Drive Summary").config(
-        "spark.driver.memory", "8g").config(
-        "spark.executor.memory", "8g").getOrCreate()
-
-    df_spark = spark.createDataFrame(df_postgres)
-    logging.info(f"已创建 Spark DataFrame: {df_spark.count()} 条记录")
-    # 提取年份和品牌分类
-    df_spark = df_spark.withColumn("year", F.year(F.col("date")))
-
-    df_spark = df_spark.withColumn("brand", F.when(df_spark.model.startswith("CT"), "Crucial")
-                                   .when(df_spark.model.startswith("DELLBOSS"), "Dell BOSS")
-                                   .when(df_spark.model.startswith("HGST"), "HGST")
-                                   .when(df_spark.model.startswith("Seagate"), "Seagate")
-                                   .when(df_spark.model.startswith("ST"), "Seagate")
-                                   .when(df_spark.model.startswith("TOSHIBA"), "Toshiba")
-                                   .when(df_spark.model.startswith("WDC"), "Western Digital")
-                                   .otherwise("Others"))
-
-    # 按年份和品牌汇总故障数
-    yearly_summary = df_spark.groupBy("year", "brand").agg(
-        F.sum(F.col("failure")).alias("drive_failures"),
-        # F.collect_set("model").alias("models")
-    )
-
-    # 将模型列转换为逗号分隔的字符串
-    # yearly_summary = yearly_summary.withColumn("models", F.concat_ws(", ", "models"))
-
-    # 显示结果
-    yearly_summary.show(20)
-
-    output_folder = f"{custom_result_dir}/yearly_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    # 删除文件夹如果已经存在
-    if os.path.exists(output_folder):
-        shutil.rmtree(output_folder)
-
-    # 保存结果到 CSV
-    yearly_summary.write.csv(output_folder, header=True)
-    logging.info(f"已保存年度汇总数据到: {output_folder}")
-
-    # 关闭 Spark 会话
-    spark.stop()
-
-
-# 支持多选的分析任务
-def choose_analysis(**kwargs):
-    analysis_types = kwargs['dag_run'].conf.get('analysis_types', ['daily'])
-    logging.info(f"选择的分析类型: {analysis_types}")
-    if 'daily' in analysis_types and 'yearly' in analysis_types:
-        return ['analyze_daily_data', 'analyze_yearly_data']
-    elif 'yearly' in analysis_types and 'daily' not in analysis_types:
-        return ['analyze_yearly_data']
-    else:
-        return ['analyze_daily_data']
-
-
-def find_csv_files(target_dir='mydata', **kwargs):
-    files = glob.glob(f'{target_dir}/**/*.csv', recursive=True)
-    logging.info(f"找到 {len(files)} 个 CSV 文件")
-    files.sort(key=lambda x: os.path.basename(x)[:10])
-    return [[file] for file in files]
-
-
+# 生成月份的时间范围
 def generate_intervals_for_month():
     conn = get_postgres_conn()
     total_query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM driver_data"
@@ -369,6 +210,7 @@ def generate_intervals_for_month():
     return intervals
 
 
+# 分月清洗数据，使用事务保证数据唯一性
 def clean_month_data(interval):
     logging.info(f"正在处理 {interval} 之间的数据")
     start_date = interval[0]
@@ -411,15 +253,141 @@ def clean_month_data(interval):
     conn.close()
 
 
+# 支持多选的分析任务
+def choose_analysis(**kwargs):
+    analysis_types = kwargs['dag_run'].conf.get('analysis_types', ['daily'])
+    logging.info(f"选择的分析类型: {analysis_types}")
+    if 'daily' in analysis_types and 'yearly' in analysis_types:
+        return ['analyze_daily_data', 'analyze_yearly_data']
+    elif 'yearly' in analysis_types and 'daily' not in analysis_types:
+        return ['analyze_yearly_data']
+    else:
+        return ['analyze_daily_data']
+
+
+# 分析每日数据 count, failure count
+def analyze_daily_data(**kwargs):
+    df_spark = None
+    spark = None
+    try:
+        conn = get_postgres_conn()
+        query = "SELECT date, failure FROM cleaned_data"
+        df_postgres = pd.read_sql(query, conn)
+        conn.close()
+        logging.info(f"已读取 {len(df_postgres)} 条记录")
+
+        spark = SparkSession.builder.appName(
+            "Daily Drive Summary").config(
+            "spark.driver.memory", "12g").config(
+            "spark.executor.memory", "12g").config(
+            "spark.executor.instances", "4").config(
+            "spark.executor.cores", "4"
+        ).getOrCreate()
+        logging.info("已初始化 Spark 会话")
+
+        df_spark = spark.createDataFrame(df_postgres)
+        logging.info(f"已创建 Spark DataFrame")
+        df_spark = df_spark.repartition(4)
+        logging.info(f"已创建 Spark Partition")
+        df_spark.persist(StorageLevel.MEMORY_AND_DISK)
+        logging.info(
+            f"已持久化数据 {StorageLevel.MEMORY_AND_DISK} DataFrame count: {df_spark.count()} 条记录, Partitions: {df_spark.rdd.getNumPartitions()}")
+        daily_summary = df_spark.groupBy("date").agg(
+            count("*").alias("drive_count"),
+            sum(col("failure")).alias("drive_failures")
+        )
+
+        daily_summary.show(100)
+        output_folder = f"{custom_result_dir}/daily_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        if os.path.exists(output_folder):
+            shutil.rmtree(output_folder)
+        daily_summary.write.csv(output_folder, header=True)
+        logging.info(f"已保存每日汇总数据到: {output_folder}")
+    except Exception as e:
+        logging.error(f"处理数据时出错: {e}")
+    finally:
+        df_spark.unpersist()
+        spark.stop()
+        logging.info("已关闭 Spark 会话")
+
+
+# 分析每年数据 brand, failure count
+def analyze_yearly_data(**kwargs):
+    df_spark = None
+    spark = None
+    try:
+        conn = get_postgres_conn()
+        query = "SELECT date, model, failure FROM cleaned_data"
+        df_postgres = pd.read_sql(query, conn)
+        conn.close()
+        logging.info(f"已读取 {len(df_postgres)} 条记录")
+
+        # 初始化 Spark 会话
+        spark = SparkSession.builder.appName("Yearly Drive Summary").config(
+            "spark.driver.memory", "12g").config(
+            "spark.executor.memory", "12g").config(
+            "spark.executor.instances", "4").config(
+            "spark.executor.cores", "4"
+        ).getOrCreate()
+        logging.info("已初始化 Spark 会话")
+
+        df_spark = spark.createDataFrame(df_postgres)
+        logging.info(f"已创建 Spark DataFrame")
+        df_spark = df_spark.repartition(4)
+        logging.info(f"已创建 Spark Partition")
+        df_spark.persist(StorageLevel.MEMORY_AND_DISK)
+        logging.info(
+            f"已持久化数据 {StorageLevel.MEMORY_AND_DISK} DataFrame count: {df_spark.count()} 条记录, Partitions: {df_spark.rdd.getNumPartitions()}")
+        # 提取年份和品牌分类
+        df_spark = df_spark.withColumn("year", F.year(F.col("date")))
+
+        df_spark = df_spark.withColumn("brand", F.when(df_spark.model.startswith("CT"), "Crucial")
+                                       .when(df_spark.model.startswith("DELLBOSS"), "Dell BOSS")
+                                       .when(df_spark.model.startswith("HGST"), "HGST")
+                                       .when(df_spark.model.startswith("Seagate"), "Seagate")
+                                       .when(df_spark.model.startswith("ST"), "Seagate")
+                                       .when(df_spark.model.startswith("TOSHIBA"), "Toshiba")
+                                       .when(df_spark.model.startswith("WDC"), "Western Digital")
+                                       .otherwise("Others"))
+
+        # 按年份和品牌汇总故障数
+        yearly_summary = df_spark.groupBy("year", "brand").agg(
+            F.sum(F.col("failure")).alias("drive_failures"),
+            # F.collect_set("model").alias("models")
+        )
+
+        # 将模型列转换为逗号分隔的字符串
+        # yearly_summary = yearly_summary.withColumn("models", F.concat_ws(", ", "models"))
+
+        # 显示结果
+        yearly_summary.show(10)
+
+        output_folder = f"{custom_result_dir}/yearly_summary_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        # 删除文件夹如果已经存在
+        if os.path.exists(output_folder):
+            shutil.rmtree(output_folder)
+
+        # 保存结果到 CSV
+        yearly_summary.write.csv(output_folder, header=True)
+        logging.info(f"已保存年度汇总数据到: {output_folder}")
+    except Exception as e:
+        logging.error(f"处理数据时出错: {e}")
+    finally:
+        df_spark.unpersist()
+        # 关闭 Spark 会话
+        spark.stop()
+        logging.info("已关闭 Spark 会话")
+
+
 # 定义 DAG
 with (DAG(
         dag_id='analyze_driver_data',
         default_args={
             'owner': 'airflow',
             'start_date': days_ago(1),
-            'retries': 1,
+            'retries': 3,
             'retry_delay': dt.timedelta(seconds=20),
-            'execution_timeout': dt.timedelta(hours=8),  # 设置任务超时时间
+            'execution_timeout': dt.timedelta(hours=12),  # 设置任务超时时间
         },
         catchup=False,
         schedule_interval=None,
@@ -489,5 +457,4 @@ with (DAG(
 
     drop_clean_table_task >> generate_month_intervals_task >> process_month_clean_tasks >> branch_task
 
-    branch_task >> [analyze_daily_task, analyze_yearly_task]
-    [analyze_daily_task, analyze_yearly_task] >> end_task
+    branch_task >> [analyze_daily_task, analyze_yearly_task] >> end_task

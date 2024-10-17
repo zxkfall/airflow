@@ -45,3 +45,8 @@ unzip zipfiles -> save data to db -> load data from db then clean data, save to 
 - each task for data clean by month almost use 8m to process(first task use 15m)
 - for daily summary, when use three month, almost use 3m to process
 - for yearly summary, when use three month, almost use 3m to process
+
+## errors fix
+
+- broken pipe: `lsof -i tcp:8746` -> `kill -9 [PID]` -> `airflow standalone`
+- clear failed job to rerun
