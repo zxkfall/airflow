@@ -1,0 +1,34 @@
+year,brand,drive_failures
+2020,HGST,112
+2022,Toshiba,609
+2023,Toshiba,508
+2022,Dell BOSS,0
+2020,Western Digital,12
+2021,Others,117
+2023,Others,12
+2019,Western Digital,14
+2023,Dell BOSS,0
+2022,Seagate,2233
+2019,Dell BOSS,0
+2020,Others,0
+2022,HGST,279
+2020,Toshiba,228
+2021,HGST,150
+2023,Western Digital,75
+2021,Seagate,1418
+2021,Western Digital,41
+2023,Seagate,2270
+2023,HGST,430
+2019,Others,0
+2019,Toshiba,111
+2019,HGST,115
+2022,Western Digital,32
+2023,Crucial,5
+2022,Crucial,3
+2021,Dell BOSS,0
+2021,Crucial,2
+2019,Seagate,1978
+2020,Seagate,1143
+2020,Dell BOSS,0
+2022,Others,2
+2021,Toshiba,430
